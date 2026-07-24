@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -74,6 +75,9 @@ DEFAULT_CONFIG = {
     "web_port": 8080,
     # When true, the gateway also self-hosts the web panel (port locked to your IPs).
     "host_panel": False,
+    # Optional: route the gateway endpoint through an upstream SOCKS5 proxy
+    # (e.g. "socks5://user:pass@geo.iproyal.com:11227"). Empty = use the node pool.
+    "upstream_proxy": "",
 }
 
 IP_LOG_PATH = HERE / "ip_history.json"
@@ -883,8 +887,125 @@ def build_gateway_forwarder(cfg: dict, region: str) -> str:
     return header + _GW_FORWARDER_BODY
 
 
+def build_upstream_relay(cfg: dict) -> str:
+    """A self-contained SOCKS5 server that forwards every CONNECT through an
+    authenticated upstream SOCKS5 proxy (e.g. IProyal). Runs on the gateway in
+    place of the plain forwarder, so the public endpoint exits via the upstream
+    while nothing else in the fleet changes. Reverting = clear upstream_proxy."""
+    u = urllib.parse.urlparse(cfg["upstream_proxy"])
+    host, port = u.hostname, u.port
+    user = urllib.parse.unquote(u.username or "")
+    password = urllib.parse.unquote(u.password or "")
+    lport = cfg["socks_port"]
+    return f'''#!/usr/bin/env python3
+import socket, threading
+UP_HOST = "{host}"
+UP_PORT = {port}
+UP_USER = "{user}"
+UP_PASS = "{password}"
+LISTEN = ("0.0.0.0", {lport})
+BUFSIZE = 65536
+
+
+def recvn(sock, n):
+    buf = b""
+    while len(buf) < n:
+        d = sock.recv(n - len(buf))
+        if not d:
+            raise OSError("peer closed")
+        buf += d
+    return buf
+
+
+def read_addr(sock, atyp):
+    if atyp == 1:
+        return recvn(sock, 4)
+    if atyp == 4:
+        return recvn(sock, 16)
+    if atyp == 3:
+        ln = recvn(sock, 1)
+        return ln + recvn(sock, ln[0])
+    raise OSError("bad atyp")
+
+
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(BUFSIZE)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    finally:
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def open_upstream(atyp, addr, port_bytes):
+    up = socket.create_connection((UP_HOST, UP_PORT), timeout=15)
+    up.sendall(b"\\x05\\x01\\x02")               # offer username/password
+    if recvn(up, 2)[1] != 0x02:
+        up.close(); raise OSError("upstream refused userpass")
+    u, p = UP_USER.encode(), UP_PASS.encode()
+    up.sendall(b"\\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+    if recvn(up, 2)[1] != 0x00:
+        up.close(); raise OSError("upstream auth failed")
+    up.sendall(b"\\x05\\x01\\x00" + bytes([atyp]) + addr + port_bytes)
+    return up
+
+
+def handle(client):
+    up = None
+    try:
+        nm = recvn(client, 2)[1]
+        recvn(client, nm)
+        client.sendall(b"\\x05\\x00")            # no auth to our own client
+        head = recvn(client, 4)                  # VER CMD RSV ATYP
+        if head[1] != 0x01:                      # only CONNECT
+            client.sendall(b"\\x05\\x07\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00")
+            client.close(); return
+        atyp = head[3]
+        addr = read_addr(client, atyp)
+        port_bytes = recvn(client, 2)
+        up = open_upstream(atyp, addr, port_bytes)
+        rep = recvn(up, 4)
+        raddr = read_addr(up, rep[3])
+        rport = recvn(up, 2)
+        client.sendall(rep + raddr + rport)
+        if rep[1] != 0x00:
+            up.close(); client.close(); return
+        threading.Thread(target=pipe, args=(client, up), daemon=True).start()
+        threading.Thread(target=pipe, args=(up, client), daemon=True).start()
+    except OSError:
+        for s in (client, up):
+            try:
+                if s: s.close()
+            except OSError:
+                pass
+
+
+def main():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(LISTEN)
+    srv.listen(256)
+    print("upstream relay on", LISTEN, "->", UP_HOST, UP_PORT, flush=True)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+
+main()
+'''
+
+
 def build_gateway_user_data(cfg: dict, region: str) -> str:
-    script = build_gateway_forwarder(cfg, region)
+    script = build_upstream_relay(cfg) if cfg.get("upstream_proxy") \
+        else build_gateway_forwarder(cfg, region)
     base = f"""#!/bin/bash
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -1161,8 +1282,13 @@ def cmd_gateway_up(cfg: dict, args) -> None:
 
     print(f"\nGateway launched: {gw_id}")
     print(f"Permanent endpoint (never changes):  {eip}:{cfg['socks_port']}")
-    print("Forwarder is installing (~60-90s). It relays to the pool's private IPs,")
-    print("so rotations are picked up automatically with no endpoint change.")
+    if cfg.get("upstream_proxy"):
+        up = urllib.parse.urlparse(cfg["upstream_proxy"])
+        print(f"UPSTREAM MODE: exiting via {up.hostname}:{up.port} "
+              "(node pool bypassed). Clear upstream_proxy to revert.")
+    else:
+        print("Forwarder is installing (~60-90s). It relays to the pool's private IPs,")
+        print("so rotations are picked up automatically with no endpoint change.")
     if cfg.get("host_panel"):
         print(f"\nWeb panel:  http://{eip}:{cfg.get('web_port', 8080)}")
         print(f"  login: {cfg.get('web_user')} / {cfg.get('web_pass')}")
