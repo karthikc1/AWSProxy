@@ -54,8 +54,8 @@ def login_required(fn):
 def status_payload() -> dict:
     regions = CFG["regions"]
     targets = pm._collect_running(CFG, regions)
-    gw = pm.load_state().get("gateway") or {}
-    endpoint = f"{gw['eip']}:{CFG['socks_port']}" if gw.get("eip") else None
+    eip = pm.resolve_gateway_eip(CFG)
+    endpoint = f"{eip}:{CFG['socks_port']}" if eip else None
 
     nodes, pinned_ip = [], None
     for i, (region, n) in enumerate(targets, 1):
