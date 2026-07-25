@@ -305,6 +305,50 @@ def list_nodes(cfg: dict, regions: list[str]):
     return out
 
 
+def discover_node_regions(cfg: dict) -> list[str]:
+    """Scan every EC2 region for managed pool nodes.
+
+    Lets the hosted panel show nodes deployed outside config.regions (e.g. a new
+    ap-southeast-1 node) without redeploying the gateway."""
+    sess = session(cfg)
+    try:
+        regions = [r["RegionName"] for r in sess.client("ec2").describe_regions()["Regions"]]
+    except ClientError:
+        return []
+
+    def probe(region: str):
+        try:
+            client = ec2(sess, region)
+            resp = client.describe_instances(
+                Filters=tag_filters(cfg) + [
+                    {"Name": "instance-state-name",
+                     "Values": ["pending", "running"]},
+                ])
+            if any(r["Instances"] for r in resp["Reservations"]):
+                return region
+        except ClientError:
+            pass
+        return None
+
+    found = []
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(regions)))) as pool:
+        for hit in pool.map(probe, regions):
+            if hit:
+                found.append(hit)
+    return sorted(found)
+
+
+def managed_regions(cfg: dict) -> list[str]:
+    """Config regions plus any region that currently has pool nodes."""
+    discovered = discover_node_regions(cfg)
+    seen, out = set(), []
+    for r in list(cfg.get("regions", [])) + discovered:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
 def cmd_status(cfg: dict, args) -> None:
     regions = args.regions or cfg["regions"]
     by_region = list_nodes(cfg, regions)
