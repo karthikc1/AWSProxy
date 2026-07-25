@@ -660,7 +660,8 @@ def cmd_menu(cfg: dict, args) -> None:
             print("No running nodes found. Deploy some first.")
             return
         gw = load_state().get("gateway") or {}
-        endpoint = f"{gw['eip']}:{cfg['socks_port']}" if gw.get("eip") else "—"
+        eip = resolve_gateway_eip(cfg)
+        endpoint = f"{eip}:{cfg['socks_port']}" if eip else "—"
         pinned_ip = next((n.get("PublicIpAddress") for _, n in targets
                           if _is_pinned(n)), None)
         mode = f"pinned -> {pinned_ip}" if pinned_ip else "round-robin"
@@ -1189,6 +1190,32 @@ def _find_gateway_instances(client, cfg):
                  {"Name": "instance-state-name",
                   "Values": ["pending", "running", "stopping", "stopped"]}])
     return [i for r in resp["Reservations"] for i in r["Instances"]]
+
+
+def resolve_gateway_eip(cfg: dict) -> str | None:
+    """Return the gateway's public EIP.
+
+    Uses local state when present (CLI machine), otherwise queries AWS — needed
+    when the web panel runs on the gateway itself and has no state.json."""
+    gw = load_state().get("gateway") or {}
+    if gw.get("eip"):
+        return gw["eip"]
+
+    regions = [gw["region"]] if gw.get("region") else list(cfg["regions"])
+    for region in regions:
+        client = ec2(session(cfg), region)
+        for inst in _find_gateway_instances(client, cfg):
+            if inst["State"]["Name"] != "running":
+                continue
+            ip = inst.get("PublicIpAddress")
+            if ip:
+                return ip
+            addrs = client.describe_addresses(
+                Filters=[{"Name": "instance-id", "Values": [inst["InstanceId"]]}])
+            for a in addrs["Addresses"]:
+                if a.get("PublicIp"):
+                    return a["PublicIp"]
+    return None
 
 
 def cmd_gateway_up(cfg: dict, args) -> None:
