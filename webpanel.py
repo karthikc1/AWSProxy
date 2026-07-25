@@ -34,6 +34,17 @@ CFG = pm.load_config()
 _action_lock = threading.Lock()
 
 
+def current_cfg() -> dict:
+    """Reload config each call so local edits apply without restarting."""
+    return pm.load_config()
+
+
+def active_targets():
+    """All running pool nodes across config + auto-discovered regions."""
+    cfg = current_cfg()
+    return cfg, pm._collect_running(cfg, pm.managed_regions(cfg))
+
+
 # --------------------------------------------------------------------------- #
 # auth
 # --------------------------------------------------------------------------- #
@@ -52,10 +63,10 @@ def login_required(fn):
 # data helpers (reuse proxymanager)
 # --------------------------------------------------------------------------- #
 def status_payload() -> dict:
-    regions = CFG["regions"]
-    targets = pm._collect_running(CFG, regions)
-    eip = pm.resolve_gateway_eip(CFG)
-    endpoint = f"{eip}:{CFG['socks_port']}" if eip else None
+    cfg, targets = active_targets()
+    eip = pm.resolve_gateway_eip(cfg)
+    endpoint = f"{eip}:{cfg['socks_port']}" if eip else None
+    gw_region = (pm.load_state().get("gateway") or {}).get("region")
 
     nodes, pinned_ip = [], None
     for i, (region, n) in enumerate(targets, 1):
@@ -63,9 +74,12 @@ def status_payload() -> dict:
         ip = n.get("PublicIpAddress")
         if pinned:
             pinned_ip = ip
+        direct = f"{ip}:{cfg['socks_port']}" if ip else "-"
         nodes.append({
             "n": i, "region": region, "instance_id": n["InstanceId"],
             "ip": ip or "-", "pinned": pinned,
+            "direct": direct,
+            "via_gateway": region == gw_region,
         })
 
     log = pm.load_ip_log().get("records", [])
@@ -80,9 +94,10 @@ def status_payload() -> dict:
 
 
 def _find_target(instance_id: str):
-    for region, n in pm._collect_running(CFG, CFG["regions"]):
+    cfg, targets = active_targets()
+    for region, n in targets:
         if n["InstanceId"] == instance_id:
-            return region, n
+            return cfg, region, n
     return None
 
 
@@ -93,8 +108,8 @@ def _find_target(instance_id: str):
 def login():
     err = ""
     if request.method == "POST":
-        if (request.form.get("user") == CFG.get("web_user")
-                and request.form.get("password") == CFG.get("web_pass")):
+        if (request.form.get("user") == current_cfg().get("web_user")
+                and request.form.get("password") == current_cfg().get("web_pass")):
             session["user"] = request.form["user"]
             return redirect(url_for("index"))
         err = "Invalid credentials."
@@ -128,9 +143,11 @@ def api_rotate():
             t = _find_target(instance_id)
             if not t:
                 return jsonify({"error": "node not found"}), 404
-            pm._rotate_targets(CFG, [t])
+            cfg, region, node = t
+            pm._rotate_targets(cfg, [(region, node)])
         else:
-            pm._rotate_targets(CFG, pm._collect_running(CFG, CFG["regions"]))
+            cfg, targets = active_targets()
+            pm._rotate_targets(cfg, targets)
     return jsonify(status_payload())
 
 
@@ -141,8 +158,9 @@ def api_pin():
     t = _find_target(instance_id)
     if not t:
         return jsonify({"error": "node not found"}), 404
+    cfg, region, _ = t
     with _action_lock:
-        pm.set_pin(CFG, t[0], instance_id)
+        pm.set_pin(cfg, region, instance_id)
     return jsonify(status_payload())
 
 
@@ -150,7 +168,8 @@ def api_pin():
 @login_required
 def api_unpin():
     with _action_lock:
-        pm.clear_pin(CFG, CFG["regions"])
+        cfg = current_cfg()
+        pm.clear_pin(cfg, pm.managed_regions(cfg))
     return jsonify(status_payload())
 
 
@@ -249,7 +268,7 @@ font-size:13px;opacity:0;transition:.3s;pointer-events:none}
 
   <div class=card>
     <table>
-      <thead><tr><th>#</th><th>Node</th><th>Exit IP</th><th></th></tr></thead>
+      <thead><tr><th>#</th><th>Region</th><th>Node</th><th>Exit IP / connect</th><th></th></tr></thead>
       <tbody id=nodes></tbody>
     </table>
   </div>
@@ -275,8 +294,10 @@ function render(d){
   const tb=$('#nodes');tb.innerHTML='';
   d.nodes.forEach(n=>{
     const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${n.n}</td><td class=mono>${n.instance_id}</td>
-      <td class=ip>${n.ip}${n.pinned?'<span class=pin-dot>● pinned</span>':''}</td>
+    const connect=n.via_gateway?(d.endpoint||n.direct):n.direct;
+    const note=n.via_gateway?' (via gateway)':' (direct)';
+    tr.innerHTML=`<td>${n.n}</td><td class=mono>${n.region}</td><td class=mono>${n.instance_id}</td>
+      <td class=ip>${connect}${note}${n.pinned?'<span class=pin-dot> ● pinned</span>':''}</td>
       <td class=actions style=justify-content:flex-end>
         <button data-rot="${n.instance_id}">Rotate</button>
         ${n.pinned?'<button data-unpin=1>Unpin</button>'
